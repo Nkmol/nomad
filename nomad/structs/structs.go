@@ -9436,6 +9436,14 @@ type Allocation struct {
 	ModifyTime int64
 }
 
+// GetID implements the IDGetter interface, required for pagination
+func (a *Allocation) GetID() string {
+	if a == nil {
+		return ""
+	}
+	return a.ID
+}
+
 // ConsulNamespace returns the Consul namespace of the task group associated
 // with this allocation.
 func (a *Allocation) ConsulNamespace() string {

@@ -1,6 +1,7 @@
 package nomad
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -74,6 +75,154 @@ func TestAllocEndpoint_List(t *testing.T) {
 	require.Equal(t, uint64(1000), resp2.Index)
 	require.Len(t, resp2.Allocations, 1)
 	require.Equal(t, alloc.ID, resp2.Allocations[0].ID)
+
+	// Lookup allocations with a filter
+	get = &structs.AllocListRequest{
+		QueryOptions: structs.QueryOptions{
+			Region:    "global",
+			Namespace: structs.DefaultNamespace,
+			Filter:    "TaskGroup == web",
+		},
+	}
+
+	var resp3 structs.AllocListResponse
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Alloc.List", get, &resp3))
+	require.Equal(t, uint64(1000), resp2.Index)
+	require.Len(t, resp3.Allocations, 1)
+	require.Equal(t, alloc.ID, resp3.Allocations[0].ID)
+}
+
+func TestAllocEndpoint_List_PaginationFiltering(t *testing.T) {
+	t.Parallel()
+	s1, _, cleanupS1 := TestACLServer(t, nil)
+	defer cleanupS1()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// create a set of allocs and field values to filter on. these are in the order
+	// that the state store will return them from the iterator (sorted by create
+	// index), for ease of writing tests.
+	mocks := []struct {
+		id        string
+		namespace string
+	}{
+		{id: "aaaa1111-3350-4b4b-d185-0e1992ed43e9"},                           // 0
+		{id: "aaaaaa22-3350-4b4b-d185-0e1992ed43e9"},                           // 1
+		{id: "aaaaaa33-3350-4b4b-d185-0e1992ed43e9", namespace: "non-default"}, // 2
+		{id: "aaaaaaaa-3350-4b4b-d185-0e1992ed43e9"},                           // 3
+		{id: "aaaaaabb-3350-4b4b-d185-0e1992ed43e9"},                           // 4
+		{id: "aaaaaacc-3350-4b4b-d185-0e1992ed43e9"},                           // 5
+		{id: "aaaaaadd-3350-4b4b-d185-0e1992ed43e9"},                           // 6
+		{id: "aaaaaaee-3350-4b4b-d185-0e1992ed43e9"},                           // 7
+		{id: "aaaaaaff-3350-4b4b-d185-0e1992ed43e9"},                           // 8
+	}
+
+	state := s1.fsm.State()
+
+	var allocs []*structs.Allocation
+	for i, m := range mocks {
+		alloc := mock.Alloc()
+		alloc.ID = m.id
+		if m.namespace != "" {
+			alloc.Namespace = m.namespace
+		}
+		// other fields
+		allocs = append(allocs, alloc)
+		index := 1000 + uint64(i)
+		require.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, index, []*structs.Allocation{alloc}))
+	}
+
+	// here
+	_ = codec
+}
+
+func TestAllocEndpoint_List_order(t *testing.T) {
+	t.Parallel()
+
+	s1, cleanupS1 := TestServer(t, nil)
+	defer cleanupS1()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create register requests
+	uuid1 := uuid.Generate()
+	alloc1 := mock.Alloc()
+	alloc1.ID = uuid1
+
+	uuid2 := uuid.Generate()
+	alloc2 := mock.Alloc()
+	alloc2.ID = uuid2
+
+	uuid3 := uuid.Generate()
+	alloc3 := mock.Alloc()
+	alloc3.ID = uuid3
+
+	err := s1.fsm.State().UpsertAllocs(structs.MsgTypeTestSetup, 1000, []*structs.Allocation{alloc1})
+	require.NoError(t, err)
+
+	err = s1.fsm.State().UpsertAllocs(structs.MsgTypeTestSetup, 1001, []*structs.Allocation{alloc2})
+	require.NoError(t, err)
+
+	err = s1.fsm.State().UpsertAllocs(structs.MsgTypeTestSetup, 1002, []*structs.Allocation{alloc3})
+	require.NoError(t, err)
+
+	// update alloc2 again so we can later assert create index order did not change
+	err = s1.fsm.State().UpsertAllocs(structs.MsgTypeTestSetup, 1003, []*structs.Allocation{alloc2})
+	require.NoError(t, err)
+
+	t.Run("ascending", func(t *testing.T) {
+		// Lookup the allocations in reverse chronological order (newest first)
+		get := &structs.AllocListRequest{
+			QueryOptions: structs.QueryOptions{
+				Region:    "global",
+				Namespace: "*",
+				Ascending: true,
+			},
+		}
+
+		var resp structs.AllocListResponse
+		err = msgpackrpc.CallWithCodec(codec, "Alloc.List", get, &resp)
+		require.NoError(t, err)
+		require.Equal(t, uint64(1003), resp.Index)
+		require.Len(t, resp.Allocations, 3)
+
+		// Assert returned order is by CreateIndex (ascending)
+		require.Equal(t, uint64(1000), resp.Allocations[0].CreateIndex)
+		require.Equal(t, uuid1, resp.Allocations[0].ID)
+
+		require.Equal(t, uint64(1001), resp.Allocations[1].CreateIndex)
+		require.Equal(t, uuid2, resp.Allocations[1].ID)
+
+		require.Equal(t, uint64(1002), resp.Allocations[2].CreateIndex)
+		require.Equal(t, uuid3, resp.Allocations[2].ID)
+	})
+
+	t.Run("descending", func(t *testing.T) {
+		// Lookup the allocations in reverse chronological order
+		get := &structs.AllocListRequest{
+			QueryOptions: structs.QueryOptions{
+				Region:    "global",
+				Namespace: "*",
+				Ascending: false,
+			},
+		}
+
+		var resp structs.AllocListResponse
+		err = msgpackrpc.CallWithCodec(codec, "Alloc.List", get, &resp)
+		require.NoError(t, err)
+		require.Equal(t, uint64(1003), resp.Index)
+		require.Len(t, resp.Allocations, 3)
+
+		// Assert returned order is by CreateIndex (descending)
+		require.Equal(t, uint64(1002), resp.Allocations[0].CreateIndex)
+		require.Equal(t, uuid3, resp.Allocations[0].ID)
+
+		require.Equal(t, uint64(1001), resp.Allocations[1].CreateIndex)
+		require.Equal(t, uuid2, resp.Allocations[1].ID)
+
+		require.Equal(t, uint64(1000), resp.Allocations[2].CreateIndex)
+		require.Equal(t, uuid1, resp.Allocations[2].ID)
+	})
 }
 
 func TestAllocEndpoint_List_Fields(t *testing.T) {
@@ -327,18 +476,23 @@ func TestAllocEndpoint_List_AllNamespaces_OSS(t *testing.T) {
 	require.NoError(t, state.UpsertNamespaces(900, []*structs.Namespace{ns1, ns2}))
 
 	// Create the allocations
+	uuid1 := uuid.Generate()
 	alloc1 := mock.Alloc()
-	alloc1.ID = "a" + alloc1.ID[1:]
+	alloc1.ID = uuid1
 	alloc1.Namespace = ns1.Name
+
+	uuid2 := uuid.Generate()
 	alloc2 := mock.Alloc()
-	alloc2.ID = "b" + alloc2.ID[1:]
+	alloc2.ID = uuid2
 	alloc2.Namespace = ns2.Name
+
 	summary1 := mock.JobSummary(alloc1.JobID)
 	summary2 := mock.JobSummary(alloc2.JobID)
 
-	require.NoError(t, state.UpsertJobSummary(999, summary1))
-	require.NoError(t, state.UpsertJobSummary(999, summary2))
-	require.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 1000, []*structs.Allocation{alloc1, alloc2}))
+	require.NoError(t, state.UpsertJobSummary(1000, summary1))
+	require.NoError(t, state.UpsertJobSummary(1001, summary2))
+	require.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 1002, []*structs.Allocation{alloc1}))
+	require.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 1003, []*structs.Allocation{alloc2}))
 
 	t.Run("looking up all allocations", func(t *testing.T) {
 		get := &structs.AllocListRequest{
@@ -349,7 +503,7 @@ func TestAllocEndpoint_List_AllNamespaces_OSS(t *testing.T) {
 		}
 		var resp structs.AllocListResponse
 		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Alloc.List", get, &resp))
-		require.Equal(t, uint64(1000), resp.Index)
+		require.Equal(t, uint64(1003), resp.Index)
 		require.Len(t, resp.Allocations, 2)
 		require.ElementsMatch(t,
 			[]string{resp.Allocations[0].ID, resp.Allocations[1].ID},
@@ -366,27 +520,25 @@ func TestAllocEndpoint_List_AllNamespaces_OSS(t *testing.T) {
 			},
 		}
 		var resp structs.AllocListResponse
+		fmt.Println("resp:", resp)
 		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Alloc.List", get, &resp))
-		require.Equal(t, uint64(1000), resp.Index)
+		require.Equal(t, uint64(1003), resp.Index)
 		require.Len(t, resp.Allocations, 1)
 		require.Equal(t, alloc1.ID, resp.Allocations[0].ID)
 		require.Equal(t, alloc1.Namespace, resp.Allocations[0].Namespace)
 	})
 
 	t.Run("looking up allocations with mismatch prefix", func(t *testing.T) {
-		// allocations were constructed above to have prefix starting with "a" or "b"
-		badPrefix := "cc"
-
 		get := &structs.AllocListRequest{
 			QueryOptions: structs.QueryOptions{
 				Region:    "global",
 				Namespace: "*",
-				Prefix:    badPrefix,
+				Prefix:    "000000", // unlikely to match
 			},
 		}
 		var resp structs.AllocListResponse
 		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Alloc.List", get, &resp))
-		require.Equal(t, uint64(1000), resp.Index)
+		require.Equal(t, uint64(1003), resp.Index)
 		require.Empty(t, resp.Allocations)
 	})
 }
