@@ -5453,16 +5453,25 @@ func (s *StateStore) ACLTokenByAccessorIDPrefix(ws memdb.WatchSet, prefix string
 }
 
 // ACLTokens returns an iterator over all the tokens
-func (s *StateStore) ACLTokens(ws memdb.WatchSet) (memdb.ResultIterator, error) {
+func (s *StateStore) ACLTokens(ws memdb.WatchSet, ascending bool) (memdb.ResultIterator, error) {
 	txn := s.db.ReadTxn()
 
-	// Walk the entire table
-	iter, err := txn.Get("acl_token", "id")
+	var it memdb.ResultIterator
+	var err error
+
+	if ascending {
+		it, err = txn.Get("acl_token", "create")
+	} else {
+		it, err = txn.GetReverse("acl_token", "create")
+	}
+
 	if err != nil {
 		return nil, err
 	}
-	ws.Add(iter.WatchCh())
-	return iter, nil
+
+	ws.Add(it.WatchCh())
+
+	return it, nil
 }
 
 // ACLTokensByGlobal returns an iterator over all the tokens filtered by global value
